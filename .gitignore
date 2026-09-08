@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+qdrant_storage/
+pg_data/
+data/processed/*.json
+data/processed/*.jsonl
+models/router/*.bin
+models/router/*.safetensors
+.pytest_cache/
+*.egg-info/
