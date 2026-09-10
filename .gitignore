@@ -7,7 +7,7 @@ qdrant_storage/
 pg_data/
 data/processed/*.json
 data/processed/*.jsonl
-models/router/*.bin
-models/router/*.safetensors
+models/router/*
+!models/router/.gitkeep
 .pytest_cache/
 *.egg-info/

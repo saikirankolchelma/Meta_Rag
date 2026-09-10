@@ -19,6 +19,7 @@ ragas==0.1.4
 
 # APIs & Utils
 groq==0.4.0
+google-genai
 python-dotenv==1.0.0
 psycopg2-binary==2.9.9
 pandas==2.1.0
