@@ -7,6 +7,8 @@ qdrant_storage/
 pg_data/
 data/processed/*.json
 data/processed/*.jsonl
+data/raw/*
+!data/raw/.gitkeep
 models/router/*
 !models/router/.gitkeep
 .pytest_cache/
