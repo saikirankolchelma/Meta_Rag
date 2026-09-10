@@ -18,10 +18,29 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from src.ingestion.embedder import embed_texts
 from src.ingestion.vector_loader import COLLECTION_HYDE, COLLECTION_NAIVE, COLLECTION_PARENT, get_client
 from src.router.predict import predict_complexity
+from src.utils.cache import get_client as get_redis_client
 from src.utils.config import GROQ_API_KEY, OPENAI_API_KEY
+from src.utils.groq_retry import call_with_retry
 
 T1_DEFAULT = 0.4
 T2_DEFAULT = 0.85
+REDIS_KEY_T1 = "router:threshold:T1"
+REDIS_KEY_T2 = "router:threshold:T2"
+
+
+def get_thresholds() -> tuple[float, float]:
+    """Reads thresholds the nightly optimizer wrote to Redis, falling back to
+    the defaults if it hasn't run yet — no gateway restart needed either way."""
+    try:
+        client = get_redis_client()
+        t1 = client.get(REDIS_KEY_T1)
+        t2 = client.get(REDIS_KEY_T2)
+        return (
+            float(t1) if t1 is not None else T1_DEFAULT,
+            float(t2) if t2 is not None else T2_DEFAULT,
+        )
+    except Exception:
+        return T1_DEFAULT, T2_DEFAULT
 
 LOCAL_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 GROQ_MODEL = "groq/compound-mini"
@@ -111,11 +130,13 @@ def generate_local(query: str, contexts: list[str]) -> tuple[str, float]:
 def generate_groq(query: str, contexts: list[str]) -> tuple[str, float]:
     client = get_groq()
     prompt = _build_prompt(query, contexts)
-    resp = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-        max_tokens=400,
+    resp = call_with_retry(
+        lambda: client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=400,
+        )
     )
     return resp.choices[0].message.content.strip(), 0.0
 
@@ -177,8 +198,12 @@ def retrieve_hyde(query: str, top_k: int = 10, final_k: int = 3) -> list[str]:
     return ranked[:final_k]
 
 
-def dispatch(query: str, t1: float = T1_DEFAULT, t2: float = T2_DEFAULT) -> dict:
+def dispatch(query: str, t1: float | None = None, t2: float | None = None) -> dict:
     start = time.time()
+    if t1 is None or t2 is None:
+        dynamic_t1, dynamic_t2 = get_thresholds()
+        t1 = t1 if t1 is not None else dynamic_t1
+        t2 = t2 if t2 is not None else dynamic_t2
     complexity_score = predict_complexity(query)
 
     if complexity_score < t1:
