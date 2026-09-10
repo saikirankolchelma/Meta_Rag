@@ -1,10 +1,12 @@
 # Core Framework
 torch==2.14.0
 transformers==5.17.0
-fastapi==0.104.0
-uvicorn==0.24.0
-# vllm==0.3.0        # Linux/WSL2 only — install separately when Week 3 local generation is set up
-# unsloth==2024.5    # Linux/WSL2 only — same
+fastapi==0.141.1
+uvicorn==0.52.4
+# vllm==0.3.0        # Linux/WSL2 only; not used — swapped for a small local transformers
+#                      model (Qwen2.5-1.5B-Instruct) to keep Week 3 dependency-light and
+#                      fit comfortably in 6GB VRAM alongside the router and embedder.
+# unsloth==2024.5    # Not needed without vLLM/local fine-tuning of the generator.
 accelerate==1.15.0
 sentencepiece==0.2.2
 protobuf==7.36.1
@@ -13,7 +15,7 @@ tiktoken==0.14.0
 # Vector & Cache
 qdrant-client==1.19.0
 sentence-transformers==6.0.1
-redis==5.0.1
+redis==8.1.0
 gptcache==0.1.37
 
 # Routing & Eval
@@ -27,7 +29,7 @@ groq==1.7.0
 openai==3.11.0
 google-genai==2.22.0
 python-dotenv==1.2.3
-psycopg2-binary==2.9.9
+psycopg2-binary==2.9.13
 pandas==3.0.5
 tenacity==9.1.4
 pytest==7.4.3

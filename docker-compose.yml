@@ -24,7 +24,8 @@ services:
       POSTGRES_PASSWORD: admin123
       POSTGRES_DB: metarag
     ports:
-      - "5432:5432"
+      # Host 5433, not 5432: a native Postgres install already occupies 5432 on this machine.
+      - "5433:5432"
     volumes:
       - ./pg_data:/var/lib/postgresql/data
     restart: unless-stopped
