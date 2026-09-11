@@ -24,6 +24,10 @@ datasets==5.0.1
 optuna==5.0.0
 ragas==0.1.4
 
+# Dashboard
+streamlit==1.63.0
+plotly==7.0.0
+
 # APIs & Utils
 groq==1.7.0
 openai==3.11.0
