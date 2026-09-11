@@ -85,9 +85,9 @@ def brute_force_query(query: str) -> dict:
     for name, (retrieve_fn, generate_fn) in STRATEGIES.items():
         contexts = retrieve_fn(query)
         answer, cost = generate_fn(query, contexts)
-        time.sleep(2)  # parent-tier generation and the judge share a Groq TPM budget
-        judged = judge_answer(query, answer, contexts)
-        time.sleep(2)
+        if name == "parent":
+            time.sleep(1)  # light pacing on the Groq (qwen3.8-27b) parent-tier call
+        judged = judge_answer(query, answer, contexts)  # OpenAI — no Groq contention
         result["strategies"][name] = {
             "answer": answer,
             "cost_usd": cost,

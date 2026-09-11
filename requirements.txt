@@ -21,7 +21,7 @@ gptcache==0.1.37
 # Routing & Eval
 scikit-learn==1.9.0
 datasets==5.0.1
-optuna==3.4.0
+optuna==5.0.0
 ragas==0.1.4
 
 # APIs & Utils

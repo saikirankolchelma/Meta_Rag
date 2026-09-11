@@ -1,15 +1,19 @@
 """LLM-as-a-judge: scores a generated answer's faithfulness and relevancy
-against its retrieved context, using Groq's free tier (groq/compound-mini).
+against its retrieved context, using OpenAI gpt-4o-mini.
+
+Not Groq: the judge fires 3x per harness query (once per strategy), and every
+Groq model tried shares tight free-tier quotas with the parent-tier generator
+under test, causing spurious cross-contention. OpenAI is cheap enough here —
+judge prompts are small — and fully decoupled from Groq's rate limits.
 """
 
 import json
 
-from groq import Groq
+from openai import OpenAI
 
-from src.utils.config import GROQ_API_KEY
-from src.utils.groq_retry import call_with_retry
+from src.utils.config import OPENAI_API_KEY
 
-JUDGE_MODEL = "groq/compound-mini"
+JUDGE_MODEL = "gpt-4o-mini"
 
 SYSTEM_PROMPT = """You are an impartial judge evaluating a RAG system's answer.
 
@@ -27,13 +31,13 @@ Question: {query}
 
 Answer to evaluate: {answer}"""
 
-_client: Groq | None = None
+_client: OpenAI | None = None
 
 
-def get_client() -> Groq:
+def get_client() -> OpenAI:
     global _client
     if _client is None:
-        _client = Groq(api_key=GROQ_API_KEY)
+        _client = OpenAI(api_key=OPENAI_API_KEY)
     return _client
 
 
@@ -41,22 +45,17 @@ def judge_answer(query: str, answer: str, contexts: list[str]) -> dict:
     context_block = "\n\n".join(contexts) if contexts else "(no context retrieved)"
     user = USER_PROMPT_TEMPLATE.format(context=context_block, query=query, answer=answer)
     try:
-        resp = call_with_retry(
-            lambda: get_client().chat.completions.create(
-                model=JUDGE_MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0.0,
-                max_tokens=100,
-            )
+        resp = get_client().chat.completions.create(
+            model=JUDGE_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.0,
+            max_tokens=100,
+            response_format={"type": "json_object"},
         )
         content = resp.choices[0].message.content.strip()
-        if content.startswith("```"):
-            content = content.strip("`")
-            if content.startswith("json"):
-                content = content[4:]
         data = json.loads(content)
         return {
             "faithfulness": max(0.0, min(1.0, float(data.get("faithfulness", 0.0)))),

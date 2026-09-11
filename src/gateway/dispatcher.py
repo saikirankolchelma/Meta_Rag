@@ -3,7 +3,7 @@ DeBERTa router's complexity score, and returns the answer plus routing metadata.
 
 Tiers:
 - naive (score < T1):      Naive RAG retrieval  -> local Qwen2.5-1.5B (free, on-GPU)
-- parent (T1 <= score < T2): Parent-doc retrieval -> Groq groq/compound-mini (free tier)
+- parent (T1 <= score < T2): Parent-doc retrieval -> Groq qwen/qwen3.8-27b (free tier)
 - hyde (score >= T2):       HyDE + cross-encoder rerank -> OpenAI gpt-4o (paid, hard tier)
 """
 
@@ -43,7 +43,10 @@ def get_thresholds() -> tuple[float, float]:
         return T1_DEFAULT, T2_DEFAULT
 
 LOCAL_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
-GROQ_MODEL = "groq/compound-mini"
+# Not groq/compound-mini: it silently proxies through llama-3.3-70b-versatile,
+# which has its own 100k-tokens/day cap shared across every compound-mini call
+# from this account (generation AND judging both hit the same hidden budget).
+GROQ_MODEL = "qwen/qwen3.8-27b"
 OPENAI_HARD_MODEL = "gpt-4o"
 OPENAI_HYDE_DRAFT_MODEL = "gpt-4o-mini"  # only drafts the hypothetical doc to embed, not the final answer
 
