@@ -1,399 +1,168 @@
-# 🧠 Meta-RAG: The Adaptive Inference Gateway
+# Meta-RAG: An Adaptive Inference Gateway
 
-**Tagline:** *A closed-loop, self-optimizing RAG system that mathematically guarantees the best answer for the lowest possible price.*
+A RAG system that **classifies each query's complexity, routes it to the cheapest tier that can answer it well, and re-tunes its own routing thresholds** from production feedback via Bayesian optimization — without a restart.
 
----
-
-## 1. Executive Summary (The "Elevator Pitch")
-
-Most RAG systems are static pipelines—they treat every user query identically, hitting the same expensive vector databases and large language models regardless of complexity. This leads to spiraling cloud costs and latency bottlenecks.
-
-**Meta-RAG** is a paradigm shift. It is an **adaptive inference gateway** that:
-
-1. **Classifies** every incoming query by complexity using a fine-tuned 183M parameter BERT model (runs locally in 5ms).
-2. **Routes** simple queries to cheap local models (Phi-3) and complex queries to powerful cloud models (GPT-4o/Groq).
-3. **Self-heals** via a nightly "Shadow Evaluation" pipeline that brute-forces 3 different retrieval strategies on production data, runs Bayesian Optimization to find perfect routing thresholds, and updates the live system via Redis—**without human intervention**.
-
-**Value Proposition:** Reduces LLM inference costs by **40-60%** while maintaining strict accuracy SLAs.
+Most RAG pipelines are static: every query hits the same retriever and the same (usually expensive) model, regardless of whether it's "What is the capital of France?" or a multi-hop reasoning question. Meta-RAG treats routing as a control problem instead.
 
 ---
 
-## 2. System Architecture
-
-### 2.1 High-Level Diagram (Mermaid)
-Copy this into your `README.md` to visualize the system:
+## How it works
 
 ```mermaid
 graph TD
     User[User Query] --> Gateway[FastAPI Gateway]
 
-    subgraph Live_Inference [⚡ Live Inference Path]
-        Gateway --> Cache{Redis Semantic Cache}
-        Cache -- Miss --> Router[🧠 Complexity Router (DeBERTa)]
-        Router --> Throttle{Read Dynamic Thresholds from Redis}
-        Throttle -- Score < T1 (Easy) --> Naive[📄 Naive RAG]
-        Throttle -- T1 < Score < T2 (Medium) --> Parent[📂 Parent-Doc RAG]
-        Throttle -- Score > T2 (Hard) --> HyDE[🔍 HyDE + Cross-Encoder]
-        
-        Naive --> Gen1[🖥️ vLLM / Phi-3 (Local GPU)]
-        Parent --> Gen2[☁️ Groq / Gemini Flash (Free Tier)]
-        HyDE --> Gen3[☁️ GPT-4o / Llama-3-70B (API)]
-        
-        Gen1 & Gen2 & Gen3 --> Aggregator[Response Builder]
-        Aggregator --> Logger[(PostgreSQL Logs)]
-        Aggregator --> User
+    subgraph Live [Live Inference Path]
+        Gateway --> Cache{Redis Cache}
+        Cache -- Hit --> User
+        Cache -- Miss --> Router[Complexity Router: fine-tuned DeBERTa-v3]
+        Router --> Thresholds{Read T1/T2 from Redis}
+        Thresholds -- below T1 --> Naive[Naive RAG: top-3 512-token chunks]
+        Thresholds -- between T1 and T2 --> Parent[Parent-Doc RAG: child-to-parent mapping]
+        Thresholds -- above T2 --> HyDE[HyDE + cross-encoder rerank]
+
+        Naive --> Gen1[Qwen2.5-1.5B local GPU - free]
+        Parent --> Gen2[Groq qwen3.8-27b - free tier]
+        HyDE --> Gen3[OpenAI gpt-4o - paid]
+
+        Gen1 & Gen2 & Gen3 --> Log[(PostgreSQL request_logs)]
+        Log --> User
     end
 
-    subgraph Offline_Optimization [🌙 Nightly Closed-Loop Control]
-        Logger -- Daily Sampling (200 queries) --> Sampler
-        Sampler --> ShadowEval[⚗️ Shadow Evaluation Harness]
-        ShadowEval -- Brute-force runs Naive/Parent/HyDE --> Judge[⚖️ LLM-as-a-Judge (Groq Free)]
-        Judge --> Metrics[📊 Confusion Matrix & Cost Matrix]
-        Metrics --> Optimizer[📈 Bayesian Threshold Tuner (Optuna)]
-        Optimizer -- New T1/T2 thresholds --> Redis[(Redis Config Update)]
+    subgraph Offline [Offline Optimization Loop]
+        Log -- sample queries --> Harness[Shadow Harness: brute-force all 3 strategies]
+        Harness --> Judge[LLM-as-Judge: gpt-4o-mini scores faithfulness + relevancy]
+        Judge --> Opt[Optuna: minimize cost s.t. accuracy SLA]
+        Opt -- new T1/T2 --> Redis[(Redis)]
+        Redis -.-> Thresholds
     end
-
-    Cache -- Hit --> User
 ```
 
-### 2.2 Component Breakdown
-
-| Component | Technology | Responsibility | Hardware Requirement |
-| :--- | :--- | :--- | :--- |
-| **API Gateway** | FastAPI + Uvicorn | Request orchestration, rate limiting, header injection | CPU |
-| **Semantic Cache** | Redis + `gptcache` | Instant response for exact/semantic duplicates | CPU (Docker) |
-| **Complexity Router** | `microsoft/deberta-v3-base` | Predicts query difficulty (0.0 to 1.0) in <5ms | CPU/GPU (1.5 GB VRAM) |
-| **Vector Database** | Qdrant (Docker) | 3 isolated collections for distinct retrieval strategies | RAM (4 GB) |
-| **Local Generator** | vLLM + `microsoft/Phi-3-mini-4k` | Serves the "Cheap" tier locally | GPU (3 GB VRAM) |
-| **Cloud Generators** | Groq (Free) / Gemini Flash | Serves "Medium" and "Expensive" tiers | API ($0) |
-| **Operational DB** | PostgreSQL | Logs every request, response, latency, and cost | CPU (Docker) |
-| **Shadow Judge** | Groq Llama-3-70B (Free) | Scores nightly samples against ground truth | API ($0) |
-| **Optimizer** | Optuna (Bayesian Search) | Finds optimal T1/T2 thresholds to maximize ROI | CPU (2 AM batch job) |
+The offline loop is the part that makes this more than a router: it replays sampled production queries through **all three** strategies, has an LLM judge score every answer, then searches the threshold space for the split that minimizes cost while holding an accuracy floor. The winning thresholds are written to Redis and picked up by the live gateway on the next request.
 
 ---
 
-## 3. Technology Stack (Exact Versions)
+## What's actually built and measured
 
-### 3.1 Hardware
-- **GPU**: NVIDIA RTX 3060 (6GB VRAM)
-- **RAM**: 16 GB System Memory
-- **OS**: Windows/Linux (WSL2 recommended for Windows)
+| Component | Implementation | Status |
+|---|---|---|
+| Complexity router | `microsoft/deberta-v3-base` (183M) + regression head | Trained, **val MSE 0.0067** |
+| Training data | 2,000 synthetic queries, balanced 666/666/668 across bands | Generated via `gpt-4o-mini` |
+| Corpus | 96 Wikipedia articles (~782k words) | Ingested |
+| Embeddings | `all-MiniLM-L6-v2` (384-dim) | — |
+| Vector store | Qdrant, 3 isolated collections | 2,314 naive / 2,314 hyde / 8,611 parent child-chunks |
+| Cheap tier | `Qwen2.5-1.5B-Instruct` via transformers, local GPU | $0/query |
+| Medium tier | Groq `qwen/qwen3.8-27b` | $0/query (free tier) |
+| Expensive tier | HyDE + `ms-marco-MiniLM-L-6-v2` rerank → `gpt-4o` | ~$0.004-0.005/query measured |
+| Cache | Redis, exact-match SHA-256 keys, 24h TTL | ~1.15ms on hit |
+| Logging | PostgreSQL `request_logs` | Per-request route, latency, cost |
+| Judge | OpenAI `gpt-4o-mini` | Faithfulness + relevancy, 0.0-1.0 |
+| Optimizer | Optuna, 50 trials over T1/T2 | Validated end-to-end |
+| Dashboard | Streamlit + Plotly over `request_logs` | — |
+| Tests | 26 passing (`pytest tests/`) | — |
 
-### 3.2 Software & Libraries
-```text
-# Core Framework
-Python=3.10
-torch=2.1.0 (CUDA 11.8)
-transformers=4.36.0
-fastapi=0.104.0
-uvicorn=0.24.0
+### The closed loop, validated
 
-# Vector & Cache
-qdrant-client=1.7.0
-redis=5.0.1
-gptcache=0.1.37
+On a 12-query shadow-eval run, the optimizer selected **T1=0.107, T2=0.919** — achieving **91.7% average accuracy at $0 cost**, because on that sample the free Groq tier answered as well as GPT-4o, so paying for the expensive tier bought nothing. The same query (`"What is the capital of France?"`, complexity 0.142) then demonstrably re-routed from `naive` to `parent` purely from the Redis update, with no code change or restart.
 
-# Local Inference
-vllm=0.3.0
-unsloth=2024.5
+The judge also caught a genuine hallucination during that run: the local 1.5B model invented *"David Gauthier"* as the originator of multiple-intelligences theory (it's Howard Gardner), and scored **faithfulness=0.0** for it.
 
-# Routing & Eval
-scikit-learn=1.3.0
-datasets=2.14.0
-optuna=3.4.0
-ragas=0.1.4
+### Measured latency
 
-# APIs & Utils
-groq=0.4.0
-python-dotenv=1.0.0
-psycopg2-binary=2.9.9
-pandas=2.1.0
-```
+| Route | Latency |
+|---|---|
+| Cache hit | ~1.2 ms |
+| Parent (Groq) | ~4.3 s |
+| HyDE (GPT-4o + rerank) | ~14.4 s |
+| Naive (local, cold start) | ~24 s — dominated by one-time model load |
 
 ---
 
-## 4. End-to-End Data Flow (Step-by-Step)
+## Setup
 
-### 4.1 Live Inference Flow (Real-Time)
-1. **Ingress**: User sends `POST /chat` with `{"query": "What is the capital of France?"}`.
-2. **Semantic Cache**: FastAPI hashes the query and checks Redis. If a semantic duplicate exists (within cosine distance threshold), it returns the cached response instantly. *Exit flow.*
-3. **Complexity Scoring**: If cache miss, the system passes the query to the fine-tuned **DeBERTa Router**. The model outputs a float `complexity_score` (e.g., `0.15`).
-4. **Threshold Lookup**: The gateway queries Redis for dynamic thresholds: `T1` (e.g., `0.4`) and `T2` (e.g., `0.85`).
-5. **Routing Decision**:
-   - **If `score < T1`**: Query is simple. Dispatch to **Naive RAG**.
-   - **If `T1 <= score < T2`**: Query is medium. Dispatch to **Parent-Document RAG**.
-   - **If `score >= T2`**: Query is complex. Dispatch to **HyDE + Re-rank RAG**.
-6. **Retrieval & Generation**:
-   - **Naive**: Embeds query → retrieves top-3 512-token chunks → generates with local **Phi-3** (vLLM).
-   - **Parent**: Retrieves 150-token child chunks → maps to 1,000-token parent contexts → generates with **Groq (Llama-3-70B)**.
-   - **HyDE**: Generates a hypothetical document → embeds that to retrieve top-10 chunks → cross-encoder re-ranks to top-3 → generates with **GPT-4o**.
-7. **Logging**: The response, `complexity_score`, `chosen_route`, `latency_ms`, and `cost_usd` are written to PostgreSQL.
-8. **Response**: The answer is streamed back to the user.
+Hardware this was built and measured on: **RTX 3050 6GB laptop GPU**, 16GB RAM, Windows 11 Home.
 
-### 4.2 Offline Optimization Flow (Nightly at 2 AM)
-1. **Trigger**: Celery Beat scheduler initiates the `nightly_optimization` task.
-2. **Sampling**: The system queries PostgreSQL for 200 random queries from the *previous 24 hours* (stratified sampling to ensure diverse routes).
-3. **Shadow Evaluation**: For these 200 queries, the harness **ignores the router** and brute-forces all 3 retrieval strategies (Naive, Parent, HyDE) against the ground-truth context.
-4. **Judging**: All 600 generated responses (200 x 3) are sent to **Groq's Llama-3-70B** (free tier) to evaluate:
-   - *Faithfulness* (Is the answer grounded in the context?).
-   - *Answer Relevancy* (Does it answer the question directly?).
-5. **Cost Calculation**: The harness calculates the hypothetical cost if *all* queries had gone to each strategy.
-6. **Bayesian Optimization (Optuna)**: The system runs 50 trials to find the new `T1` and `T2` thresholds that:
-   - **Constraint**: Maintain Average Accuracy >= 90% (SLA).
-   - **Objective**: Minimize Total Daily Cost.
-7. **Atomic Update**: The new thresholds are pushed to Redis using `SET` commands. **No server restart is required**; the live gateway reads these dynamically on the next request.
-
----
-
-## 5. Core Components (Deep Dive)
-
-### 5.1 The Complexity Router (The Brain)
-- **Architecture**: `microsoft/deberta-v3-base` (183M params) with a single linear regression head.
-- **Training Data**: 2,000 synthetic queries labeled with complexity scores (generated via Groq's Llama-3-70B).
-- **Training Specs**:
-  - Batch Size: 32 (fits easily on 6GB VRAM with `fp16`).
-  - Learning Rate: `2e-5`.
-  - Epochs: 5.
-  - Loss Function: Mean Squared Error (MSE).
-- **Inference**: Runs on CPU in production (<5ms) using `torch.no_grad()`.
-
-### 5.2 Retrieval Strategies (The Body)
-All strategies use `all-MiniLM-L6-v2` for embedding (384 dimensions) to keep the database lightweight.
-
-| Strategy | Chunk Size | Overlap | Collection Name | Use Case |
-| :--- | :--- | :--- | :--- | :--- |
-| **Naive** | 512 tokens | 50 tokens | `collection_naive` | Simple factual questions. |
-| **Parent-Doc** | Child: 150 tokens<br>Parent: 1,000 tokens | 20 tokens | `collection_parent` | Queries requiring broader context/summaries. |
-| **HyDE** | 512 tokens (hypothetical embeddings) | 50 tokens | `collection_hyde` | Complex, multi-hop, or ambiguous queries. |
-
-### 5.3 The Threshold Optimizer (The Nervous System)
-- **Algorithm**: Bayesian Optimization (via `optuna`).
-- **Search Space**: `T1` (0.1 to 0.6), `T2` (0.5 to 0.95), with constraint `T1 < T2`.
-- **Objective Function**: 
-  ```python
-  def objective(trial):
-      T1 = trial.suggest_float("T1", 0.1, 0.6)
-      T2 = trial.suggest_float("T2", 0.5, 0.95)
-      # Simulate routing based on T1/T2 on the 200 sampled queries
-      cost = simulate_routing_cost(T1, T2)
-      accuracy = simulate_routing_accuracy(T1, T2)
-      if accuracy < 0.90:  # SLA constraint
-          return float('inf')
-      return cost  # Minimize cost
-  ```
-
----
-
-## 6. Project Directory Structure
-
-```
-meta-rag/
-├── docker-compose.yml             # Qdrant, Redis, Postgres
-├── requirements.txt
-├── Makefile                       # Aliases for train, serve, eval
-├── .env.example                   # Template for API keys
-│
-├── data/
-│   ├── raw/                       # Place your PDFs/TXT files here
-│   └── processed/                 # Chunked JSON outputs from ingestion
-│
-├── models/
-│   └── router/                    # Saved DeBERTa model
-│       ├── config.json
-│       ├── pytorch_model.bin
-│       └── tokenizer_config.json
-│
-├── src/
-│   ├── ingestion/
-│   │   ├── __init__.py
-│   │   ├── chunker.py             # Implements 3 chunking strategies
-│   │   ├── embedder.py            # Wrapper for all-MiniLM-L6-v2
-│   │   └── vector_loader.py       # Uploads to Qdrant collections
-│   │
-│   ├── router/
-│   │   ├── __init__.py
-│   │   ├── train.py               # Fine-tunes DeBERTa on synthetic data
-│   │   ├── predict.py             # Loads model for inference
-│   │   └── generate_synthetic.py  # Uses Groq API to create training data
-│   │
-│   ├── gateway/
-│   │   ├── __init__.py
-│   │   ├── main.py                # FastAPI entrypoint (uvicorn)
-│   │   ├── dispatcher.py          # Routing logic (Naive/Parent/HyDE)
-│   │   └── schemas.py             # Pydantic models for requests/responses
-│   │
-│   ├── eval/
-│   │   ├── __init__.py
-│   │   ├── shadow_harness.py      # Nightly brute-force generator
-│   │   ├── judge.py               # Calls Groq/Judge LLM
-│   │   └── optimizer.py           # Optuna threshold tuner
-│   │
-│   └── utils/
-│       ├── __init__.py
-│       ├── cache.py               # Redis semantic cache wrapper
-│       ├── logger.py              # PostgreSQL logging interface
-│       └── config.py              # Centralized env/conf loading
-│
-├── scripts/
-│   ├── run_api.sh                 # Starts Uvicorn with 4 workers
-│   └── run_celery.sh              # Starts Celery Beat & Worker
-│
-├── tests/
-│   ├── test_router.py
-│   └── test_ingestion.py
-│
-└── notebooks/                     # Optional: Exploration notebooks
-    └── eda_queries.ipynb
-```
-
----
-
-## 7. Setup & Installation Guide
-
-### 7.1 Prerequisites
-- Docker Desktop installed and running.
-- NVIDIA drivers installed (for GPU access).
-- Anaconda/Miniconda installed.
-
-### 7.2 Environment Setup
 ```bash
-# 1. Clone repo (or create folder)
-mkdir meta-rag && cd meta-rag
+# 1. Environment
+python -m venv .venv
+.venv/Scripts/activate        # Windows; use source .venv/bin/activate on Linux
 
-# 2. Create Conda environment
-conda create -n metarag python=3.10 -y
-conda activate metarag
+# 2. PyTorch with CUDA — the plain PyPI wheel is CPU-only on Windows.
+#    Pick the cuXXX index matching your driver; cu126 was correct here.
+pip install torch --index-url https://download.pytorch.org/whl/cu126
 
-# 3. Install PyTorch (CUDA 11.8 for RTX 3060)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-
-# 4. Install requirements
+# 3. Everything else
 pip install -r requirements.txt
+
+# 4. Infrastructure (Docker Desktop required; on Windows Home this needs WSL2)
+docker-compose up -d           # Qdrant :6333, Redis :6379, Postgres :5433
+
+# 5. Secrets
+cp .env.example .env           # then fill in your API keys
 ```
 
-### 7.3 Docker Compose (Infrastructure)
-Save this as `docker-compose.yml`:
-```yaml
-version: '3.8'
+> **Postgres is published on host port 5433, not 5432** — a native Postgres install already occupied 5432 on the development machine, and the collision produced a confusing auth failure rather than a clean port-in-use error.
 
-services:
-  qdrant:
-    image: qdrant/qdrant:latest
-    ports:
-      - "6333:6333"
-    volumes:
-      - ./qdrant_storage:/qdrant/storage
-    environment:
-      - QDRANT__SERVICE__GRPC_PORT=6334
-    restart: unless-stopped
+### Running the pipeline
 
-  redis:
-    image: redis:alpine
-    ports:
-      - "6379:6379"
-    restart: unless-stopped
-
-  postgres:
-    image: postgres:15-alpine
-    environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: admin123
-      POSTGRES_DB: metarag
-    ports:
-      - "5432:5432"
-    volumes:
-      - ./pg_data:/var/lib/postgresql/data
-    restart: unless-stopped
-```
-Run with: `docker-compose up -d`
-
-### 7.4 API Keys Setup
-Create a `.env` file (never commit this):
-```env
-GROQ_API_KEY="gsk_..."          # Free from console.groq.com
-OPENAI_API_KEY="sk-..."         # Optional, only for GPT-4o tier
-GOOGLE_API_KEY="..."            # Optional, for Gemini Flash
-POSTGRES_URL="postgresql://admin:admin123@localhost:5432/metarag"
-REDIS_URL="redis://localhost:6379"
-QDRANT_URL="http://localhost:6333"
-```
-
----
-
-## 8. The 5-Week Execution Roadmap
-
-| Week | Phase | Key Deliverable | Hardware Utilization |
-| :--- | :--- | :--- | :--- |
-| **1** | **Synthetic Data & Router** | Generate 2k Q&A pairs via Groq; Fine-tune DeBERTa (30 mins training). | GPU (1.5 GB) |
-| **2** | **Ingestion Pipeline** | Chunk 100 Wikipedia articles; Upload 3 collections to Qdrant. | RAM/CPU |
-| **3** | **Gateway & Dispatcher** | Build FastAPI server; Integrate vLLM (Phi-3) + Groq/Gemini APIs. | GPU (3 GB for vLLM) |
-| **4** | **Shadow Eval & Optimizer** | Write nightly harness; Integrate Optuna; Auto-update Redis thresholds. | CPU / Free APIs |
-| **5** | **Dashboard & Polishing** | Build Streamlit/Gradio dashboard; Write Blog/README; Record Loom demo. | CPU |
-
----
-
-## 9. Budget & Cost Analysis
-
-**Development Phase (You):**
-- Groq API: **$0** (Free tier: 30 req/min).
-- OpenAI/Gemini: **$0** (Optional, you can stick to Groq).
-- Docker/Infra: **$0** (Local).
-- GPU Electricity: ~$0.50 per full training run.
-
-**Production Simulation (Hypothetical):**
-Assuming 1,000 queries/day, Meta-RAG reduces costs versus a pure GPT-4o pipeline:
-
-| Scenario | Strategy | Daily Cost | Monthly Cost |
-| :--- | :--- | :--- | :--- |
-| **Baseline** | All Queries to GPT-4o | $25.00 | $750 |
-| **Meta-RAG (Optimized)** | 60% Naive (Local), 30% Grok, 10% GPT-4o | **$3.50** | **$105** |
-| **Total Savings** | | **~86%** | **~$645/month** |
-
----
-
-## 10. How to Test & Validate
-
-### 10.1 Unit Test (Router Accuracy)
 ```bash
-python -m pytest tests/test_router.py
-```
-*Expected output:* MSE < 0.01 on the holdout set.
+python -m src.router.generate_synthetic --samples 2000   # build training data
+python -m src.router.train                                # fine-tune the router (~135s on RTX 3050)
+python -m src.ingestion.fetch_wikipedia                   # pull the corpus
+python -m src.ingestion.vector_loader                     # chunk, embed, load all 3 collections
 
-### 10.2 End-to-End API Test (cURL)
+uvicorn src.gateway.main:app --port 8000                  # serve the gateway
+streamlit run src/dashboard/app.py                        # ops dashboard
+
+python -m src.eval.shadow_harness --samples 20            # offline: brute-force + judge
+python -m src.eval.optimizer --trials 50 --sla 0.90       # offline: tune + push to Redis
+```
+
 ```bash
 curl -X POST http://localhost:8000/chat \
   -H "Content-Type: application/json" \
-  -d '{"query": "Explain quantum physics in simple terms"}'
+  -d '{"query": "How does deforestation affect biodiversity?"}'
+# Response headers carry X-Route-Chosen and X-Cache-Hit
 ```
-*Check Headers:* You should see `X-Route-Chosen: HyDE` or `Naive`.
-
-### 10.3 Grafana Dashboard (Logging)
-If you install `prometheus_client`, expose metrics at `/metrics`. But for simplicity, a Streamlit dashboard that queries PostgreSQL will show:
-- Queries per route (bar chart).
-- Average latency per route.
-- Estimated daily cost savings.
 
 ---
 
-## 11. Future Improvements (Beyond the MVP)
+## Engineering decisions worth explaining
 
-1. **Multi-Modal Input**: Extend to images (using CLIP embeddings) for PDFs with charts.
-2. **Adaptive Temperature**: Dynamically adjust LLM `temperature` based on query ambiguity (uncertainty sampling).
-3. **User Feedback Loop**: Allow users to thumbs-up/down answers. Feed this explicitly into the Shadow Eval as a hard constraint.
-4. **Cache Invalidation**: If the nightly eval finds the cached response is now sub-optimal, automatically invalidate the specific Redis key.
+**Local tier is `transformers` + Qwen2.5-1.5B, not vLLM + Phi-3.** vLLM is Linux-only, and Phi-3-mini (3.8B) in fp16 needs ~7.5GB — more than the 6GB card has, before accounting for the router, embedder, and cross-encoder that share the same process and VRAM. A 1.5B model in fp16 fits alongside them with headroom.
 
----
+**Training runs in fp32, not mixed precision.** DeBERTa-v3's checkpoint ships fp16 weights; combining those with bf16 autocast produced exploding gradients (grad norms of 300-800, eval MSE 0.66 — worse than predicting the mean). Forcing fp32 weight loading fixed the math, and dropping autocast entirely sidestepped a `CUBLAS_STATUS_EXECUTION_FAILED` in bf16 GEMM on this GPU. The dataset is small enough that fp32 costs ~135s total.
 
-## 12. Conclusion: Your Interview "Kill Shot"
+**The judge runs on OpenAI, not Groq.** `groq/compound-mini` silently proxies to `llama-3.3-70b-versatile`, which carries its own 100k-tokens/day account-wide cap. Because the judge fires 3× per harness query *and* the parent tier used the same model, they exhausted that shared budget mid-run. Moving the judge off Groq decoupled them.
 
-By completing this project, you are not just an "AI Engineer." You are an **AI Systems Architect**.
+**Wikipedia ingestion fetches one article per request.** The MediaWiki API silently caps full-text extracts at `exlimit=1`; batching titles returns one article's text and empty extracts for the rest, which looks like "article not found" rather than a limit.
 
-When a recruiter asks, *"What makes you different from other candidates?"*, you deliver this exact line:
+## Known limitations
 
-> *"Most engineers build models. I build control systems for models. I built an adaptive gateway that doesn't just answer questions—it profiles its own performance nightly, runs Bayesian optimization to tweak its internal routing, and automatically tightens its belt when costs are high. I turned a $750 monthly inference bill into $105 while keeping accuracy pinned at 91%. I don't guess about performance; I mathematically guarantee it."*
+These are deliberate scope cuts, not oversights:
 
----
+- **The cache is exact-match, not semantic.** Real traffic phrases the same question many ways, so the true hit rate would be well below what semantic matching would deliver.
+- **The nightly loop isn't scheduled.** `shadow_harness` and `optimizer` are run manually; there's no Celery Beat / cron wiring yet.
+- **Shadow-eval samples are small** (12-20, not the 200/night the design targets), because brute-forcing every strategy means paying for a GPT-4o call per query per run.
+- **No horizontal scaling.** Every worker process loads its own copy of all four models into VRAM. Production would need a shared model server (vLLM/Triton) behind the gateway.
+- **Cost savings are measured on this corpus and sample**, not extrapolated to a traffic profile. The optimizer's "$0 cost" result reflects a 12-query sample where the free tier sufficed — not a claim about production economics.
 
-**This document is your bible.** Keep it in your project root, update it as you build, and present it as your primary portfolio piece.
+## Testing
 
-Now, start with **Week 1**: Run `python src/router/generate_synthetic.py` and watch your model learn. You've got the blueprint—go build the future. 🚀
+```bash
+pytest tests/ -v    # 26 tests
+```
+
+Covers chunker token-boundary invariants (size limits, overlap correctness, no gaps), the trained router's band ordering on held-out queries, threshold→strategy mapping at exact boundaries, cost/accuracy aggregation, Redis threshold fallback (empty/unreachable/populated), and the Groq retry helper's backoff behavior. Router tests skip cleanly if the model hasn't been trained, since `models/router/` is gitignored.
+
+## Layout
+
+```
+src/
+├── router/       generate_synthetic.py · train.py · predict.py
+├── ingestion/    fetch_wikipedia.py · chunker.py · embedder.py · vector_loader.py
+├── gateway/      main.py · dispatcher.py · schemas.py
+├── eval/         shadow_harness.py · judge.py · optimizer.py
+├── dashboard/    app.py
+└── utils/        config.py · cache.py · logger.py · groq_retry.py
+```
