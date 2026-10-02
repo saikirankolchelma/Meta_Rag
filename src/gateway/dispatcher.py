@@ -1,12 +1,15 @@
-"""Routes a query to one of three retrieval+generation tiers based on the
-DeBERTa router's complexity score, and returns the answer plus routing metadata.
+"""Routes a query to one of three retrieval+generation tiers, choosing between
+the EV decision model (expected quality minus cost minus latency, estimated
+from shadow-eval history) and a static two-threshold fallback when there's
+no historical data to trust yet. See decision_model.py for the EV logic.
 
 Tiers:
-- naive (score < T1):      Naive RAG retrieval  -> local Qwen2.5-1.5B (free, on-GPU)
-- parent (T1 <= score < T2): Parent-doc retrieval -> Groq qwen/qwen3.8-27b (free tier)
-- hyde (score >= T2):       HyDE + cross-encoder rerank -> OpenAI gpt-4o (paid, hard tier)
+- naive:  Naive RAG retrieval      -> local Qwen2.5-1.5B (free, on-GPU)
+- parent: Parent-doc retrieval     -> Groq qwen/qwen3.8-27b (free tier)
+- hyde:   HyDE + cross-encoder rerank -> OpenAI gpt-4o (paid, hard tier)
 """
 
+import json
 import time
 
 import torch
@@ -15,6 +18,8 @@ from openai import OpenAI
 from sentence_transformers import CrossEncoder
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from src.eval.decision_model import choose_route_by_ev
+from src.eval.routing_rules import T1_DEFAULT, T2_DEFAULT
 from src.ingestion.embedder import embed_texts
 from src.ingestion.vector_loader import COLLECTION_HYDE, COLLECTION_NAIVE, COLLECTION_PARENT, get_client
 from src.router.predict import predict_complexity
@@ -22,15 +27,15 @@ from src.utils.cache import get_client as get_redis_client
 from src.utils.config import GROQ_API_KEY, OPENAI_API_KEY
 from src.utils.groq_retry import call_with_retry
 
-T1_DEFAULT = 0.4
-T2_DEFAULT = 0.85
 REDIS_KEY_T1 = "router:threshold:T1"
 REDIS_KEY_T2 = "router:threshold:T2"
+REDIS_KEY_DECISION_CONFIG = "router:decision_config"
 
 
 def get_thresholds() -> tuple[float, float]:
-    """Reads thresholds the nightly optimizer wrote to Redis, falling back to
-    the defaults if it hasn't run yet — no gateway restart needed either way."""
+    """Reads the legacy two-key thresholds, falling back to the defaults if
+    they're absent — kept standalone (dispatch() uses get_decision_config()
+    instead, which reads the newer consolidated key)."""
     try:
         client = get_redis_client()
         t1 = client.get(REDIS_KEY_T1)
@@ -41,6 +46,28 @@ def get_thresholds() -> tuple[float, float]:
         )
     except Exception:
         return T1_DEFAULT, T2_DEFAULT
+
+
+def get_decision_config() -> tuple[float, float, dict | None, float, float]:
+    """Reads the EV decision config (thresholds, EV weights, tier profiles)
+    the nightly optimizer wrote to Redis as one JSON blob, falling back to
+    defaults with no profile data if it hasn't run yet or Redis errors —
+    choose_route_by_ev degrades gracefully to the threshold rule in that case."""
+    try:
+        client = get_redis_client()
+        raw = client.get(REDIS_KEY_DECISION_CONFIG)
+        if raw is None:
+            return T1_DEFAULT, T2_DEFAULT, None, 0.0, 0.0
+        config = json.loads(raw)
+        return (
+            float(config["t1"]),
+            float(config["t2"]),
+            config["profiles"],
+            float(config["lambda_cost"]),
+            float(config["lambda_latency"]),
+        )
+    except Exception:
+        return T1_DEFAULT, T2_DEFAULT, None, 0.0, 0.0
 
 LOCAL_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 # Not groq/compound-mini: it silently proxies through llama-3.3-70b-versatile,
@@ -203,24 +230,41 @@ def retrieve_hyde(query: str, top_k: int = 10, final_k: int = 3) -> list[str]:
 
 def dispatch(query: str, t1: float | None = None, t2: float | None = None) -> dict:
     start = time.time()
+    # Built fresh per call (not a module-level dict) so monkeypatching
+    # retrieve_*/generate_* as module attributes in tests actually takes
+    # effect: a dict literal built once at import time would instead bind
+    # permanently to whatever functions existed at that moment.
+    strategies = {
+        "naive": (retrieve_naive, generate_local),
+        "parent": (retrieve_parent, generate_groq),
+        "hyde": (retrieve_hyde, generate_openai_hard),
+    }
+    profiles, lambda_cost, lambda_latency = {}, 0.0, 0.0
+
+    # Only consult Redis when the caller didn't pin both thresholds explicitly
+    # — this keeps dispatch(query, t1=.., t2=..) fully deterministic (no EV,
+    # plain threshold routing) regardless of what a local optimizer run has
+    # pushed to Redis, which is exactly what the existing unit tests rely on.
     if t1 is None or t2 is None:
-        dynamic_t1, dynamic_t2 = get_thresholds()
+        dynamic_t1, dynamic_t2, dynamic_profiles, lambda_cost, lambda_latency = get_decision_config()
         t1 = t1 if t1 is not None else dynamic_t1
         t2 = t2 if t2 is not None else dynamic_t2
-    complexity_score = predict_complexity(query)
+        profiles = dynamic_profiles or {}
 
-    if complexity_score < t1:
-        route = "naive"
-        contexts = retrieve_naive(query)
-        answer, cost = generate_local(query, contexts)
-    elif complexity_score < t2:
-        route = "parent"
-        contexts = retrieve_parent(query)
-        answer, cost = generate_groq(query, contexts)
-    else:
-        route = "hyde"
-        contexts = retrieve_hyde(query)
-        answer, cost = generate_openai_hard(query, contexts)
+    complexity_score = predict_complexity(query)
+    # With no profile data (explicit-override callers, or a fresh deployment
+    # with no shadow-eval history), choose_route_by_ev degrades to the plain
+    # score_to_tier(score, t1, t2) threshold rule on its own.
+    route, used_ev, ev_scores = choose_route_by_ev(complexity_score, profiles, lambda_cost, lambda_latency, t1, t2)
+
+    retrieve_fn, generate_fn = strategies[route]
+    contexts = retrieve_fn(query)
+    answer, cost = generate_fn(query, contexts)
+
+    ev_margin = None
+    if ev_scores is not None:
+        top_two = sorted(ev_scores.values(), reverse=True)
+        ev_margin = top_two[0] - top_two[1]
 
     latency_ms = (time.time() - start) * 1000
     return {
@@ -229,4 +273,7 @@ def dispatch(query: str, t1: float | None = None, t2: float | None = None) -> di
         "complexity_score": complexity_score,
         "latency_ms": latency_ms,
         "cost_usd": cost,
+        "used_ev": used_ev,
+        "ev_scores": ev_scores,
+        "ev_margin": ev_margin,
     }

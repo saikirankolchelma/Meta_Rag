@@ -84,13 +84,16 @@ def brute_force_query(query: str) -> dict:
 
     for name, (retrieve_fn, generate_fn) in STRATEGIES.items():
         contexts = retrieve_fn(query)
+        gen_start = time.perf_counter()
         answer, cost = generate_fn(query, contexts)
+        latency_ms = (time.perf_counter() - gen_start) * 1000
         if name == "parent":
             time.sleep(1)  # light pacing on the Groq (qwen3.8-27b) parent-tier call
         judged = judge_answer(query, answer, contexts)  # OpenAI — no Groq contention
         result["strategies"][name] = {
             "answer": answer,
             "cost_usd": cost,
+            "latency_ms": latency_ms,
             "faithfulness": judged["faithfulness"],
             "relevancy": judged["relevancy"],
         }

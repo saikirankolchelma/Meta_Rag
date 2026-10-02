@@ -36,6 +36,8 @@ def chat(request: ChatRequest, response: Response):
         latency_ms=result["latency_ms"],
         cost_usd=result["cost_usd"],
         cache_hit=False,
+        used_ev=result["used_ev"],
+        ev_margin=result["ev_margin"],
     )
     set_cached_response(request.query, result)
 
